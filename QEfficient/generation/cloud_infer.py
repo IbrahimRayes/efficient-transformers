@@ -437,6 +437,19 @@ class QAICInferenceSession:
         Return:
             :Dict[str, np.ndarray]:
         """
+        self.submit(inputs)
+        return self.collect()
+
+    def submit(self, inputs: Dict[str, np.ndarray]) -> None:
+        """
+        Bind ``inputs`` and start one inference without waiting for it; ``collect()`` waits and returns its outputs.
+
+        ``run(inputs)`` is ``submit(inputs)`` followed by ``collect()``. Host work placed between the two overlaps the
+        device. One inference at a time per session: call ``collect()`` before the next ``submit()``.
+
+        Args:
+            :inputs (Dict[str, np.ndarray]): Processed numpy inputs for the model.
+        """
         # Set inputs
         self.set_buffers(inputs)
         input_dumper = getattr(self, "input_dumper", None)
@@ -460,6 +473,14 @@ class QAICInferenceSession:
         if self.queue.enqueue(self.execObj) != qaicrt.QStatus.QS_SUCCESS:
             self._release_program_after_run_failure()
             raise MemoryError("Failed to enqueue")
+
+    def collect(self) -> Dict[str, np.ndarray]:
+        """
+        Wait for the inference started by ``submit()`` and return its outputs.
+
+        Return:
+            :Dict[str, np.ndarray]:
+        """
         if self.execObj.waitForCompletion() != qaicrt.QStatus.QS_SUCCESS:
             self._release_program_after_run_failure()
             raise ValueError(self._shape_mismatch_message(self.buf_dims))

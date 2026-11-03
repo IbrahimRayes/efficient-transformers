@@ -8,13 +8,13 @@
 import json
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
-from transformers.generation.logits_process import MinPLogitsWarper, TopPLogitsWarper
+from transformers.generation.logits_process import TopPLogitsWarper
 
 try:
     from chatterbox.models.s3tokenizer import drop_invalid_tokens
@@ -78,6 +78,21 @@ def _load_local_cangjie(tokenizer, checkpoint_dir: str) -> None:
     logger.info(f"Loaded the Cangjie table for Chinese from {path}.")
 
 
+def _same_fields(saved: dict, current: dict) -> bool:
+    """True if two ``vars()`` snapshots hold the same values (tensors compared by content)."""
+    if saved.keys() != current.keys():
+        return False
+    for key, value in current.items():
+        old = saved[key]
+        if torch.is_tensor(value) != torch.is_tensor(old):
+            return False
+        if torch.is_tensor(value) and not (value.shape == old.shape and torch.equal(value, old)):
+            return False
+        if not torch.is_tensor(value) and value is not old and value != old:
+            return False
+    return True
+
+
 class QEffChatterboxMultilingualTTS:
     """
     Resemble AI Chatterbox Multilingual (text-to-speech) on Cloud AI 100.
@@ -130,6 +145,7 @@ class QEffChatterboxMultilingualTTS:
         }
         self.custom_config = None
         self.checkpoint_dir = None  # set by from_pretrained
+        self._t3_cond_cache = None  # (T3Cond, copy of its fields, conditioning embeddings) of the last voice
 
     @classmethod
     @log_pipeline_api("from_pretrained", "Text-to-speech model loading completed.", "load_complete")
@@ -233,15 +249,30 @@ class QEffChatterboxMultilingualTTS:
         for module_name in self.modules:
             self._session(module_name)
 
-    def _run(self, module_name: str, output_shapes: Dict[str, tuple], **inputs) -> Dict[str, np.ndarray]:
-        """Run one graph; output buffers sized for this call select the matching specialization (bucket)."""
+    def _run_start(
+        self, module_name: str, output_shapes: Dict[str, tuple], **inputs
+    ) -> Callable[[], Dict[str, np.ndarray]]:
+        """Start one graph on the device; returns the function that waits for it and returns its outputs.
+
+        Output buffers sized for this call select the matching specialization (bucket). Host work done before calling
+        the returned function overlaps the device.
+        """
         session = self._session(module_name)
         session.set_buffers({name: np.zeros(shape, dtype=np.float32) for name, shape in output_shapes.items()})
-        try:
-            return session.run({name: np.asarray(value) for name, value in inputs.items()})
-        except Exception:
-            self.modules[module_name].qpc_session = None  # a failed run unloads the program: reopen it next time
-            raise
+
+        def guarded(step, *args):
+            try:
+                return step(*args)
+            except Exception:
+                self.modules[module_name].qpc_session = None  # a failed run unloads the program: reopen it next time
+                raise
+
+        guarded(session.submit, {name: np.asarray(value) for name, value in inputs.items()})
+        return lambda: guarded(session.collect)
+
+    def _run(self, module_name: str, output_shapes: Dict[str, tuple], **inputs) -> Dict[str, np.ndarray]:
+        """Run one graph and wait for its outputs."""
+        return self._run_start(module_name, output_shapes, **inputs)()
 
     def _buckets(self, module_name: str, symbol: str) -> List[int]:
         return sorted(spec[symbol] for spec in self.custom_config["modules"][module_name]["specializations"])
@@ -285,19 +316,43 @@ class QEffChatterboxMultilingualTTS:
         text_tokens = F.pad(text_tokens, (1, 0), value=t3.hp.start_text_token)
         text_tokens = F.pad(text_tokens, (0, 1), value=t3.hp.stop_text_token).long()
         start = t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
-        embeds, _ = t3.prepare_input_embeds(
-            t3_cond=self.model.conds.t3, text_tokens=text_tokens, speech_tokens=start, cfg_weight=cfg_weight
-        )
+        # T3.prepare_input_embeds (models/t3/t3.py:102-130) with the voice conditioning computed once per voice
+        text_emb = t3.text_emb(text_tokens)
+        if cfg_weight > 0.0 and not t3.is_gpt:
+            text_emb[1].zero_()  # CFG uncond
+        speech_emb = t3.speech_emb(start)
+        if t3.hp.input_pos_emb == "learned":
+            text_emb = text_emb + t3.text_pos_emb(text_tokens)
+            speech_emb = speech_emb + t3.speech_pos_emb(start)
+        cond_emb = self._t3_conditioning().expand(text_emb.size(0), -1, -1)
+        embeds = torch.cat([cond_emb, text_emb, speech_emb], dim=1)
         # T3.inference appends the start-of-speech embedding once more before the first forward pass
         bos = t3.speech_emb(torch.tensor([[t3.hp.start_speech_token]])) + t3.speech_pos_emb.get_fixed_embedding(0)
         return torch.cat([embeds, torch.cat([bos, bos])], dim=1)
 
-    def _t3_forward(self, inputs_embeds: np.ndarray, position_ids: np.ndarray) -> np.ndarray:
+    def _t3_conditioning(self) -> torch.Tensor:
+        """``T3.prepare_conditioning`` of the current voice, cached while the fields of its ``T3Cond`` are unchanged."""
+        cond = self.model.conds.t3
+        cache = self._t3_cond_cache
+        if cache is None or cache[0] is not cond or not _same_fields(cache[1], vars(cond)):
+            emb = self.model.t3.prepare_conditioning(cond)  # also fills cond.cond_prompt_speech_emb
+            self._t3_cond_cache = (
+                cond,
+                {key: value.clone() if torch.is_tensor(value) else value for key, value in vars(cond).items()},
+                emb,
+            )
+        return self._t3_cond_cache[2]
+
+    def _t3_forward_start(self, inputs_embeds: np.ndarray, position_ids: np.ndarray) -> Callable[[], np.ndarray]:
         vocab_size = self.model.t3.hp.speech_tokens_dict_size
         output_shapes = {"logits": (constants.CHATTERBOX_T3_CFG_BATCH_SIZE, 1, vocab_size)}
-        return self._run(
+        wait = self._run_start(
             "t3", output_shapes, inputs_embeds=np.asarray(inputs_embeds, dtype=np.float32), position_ids=position_ids
-        )["logits"]
+        )
+        return lambda: wait()["logits"]
+
+    def _t3_forward(self, inputs_embeds: np.ndarray, position_ids: np.ndarray) -> np.ndarray:
+        return self._t3_forward_start(inputs_embeds, position_ids)()
 
     def _t3_prefill(self, prefill: torch.Tensor) -> np.ndarray:
         """Chunked prefill; padded positions get position id -1, as in QEfficient text generation."""
@@ -331,9 +386,14 @@ class QEffChatterboxMultilingualTTS:
         Same tokens as the upstream loop for the same seed and logits (checked token for token), with less host work:
         the repetition penalty is one ``torch.where`` over a running mask of seen tokens (same per-element arithmetic
         as the processor's gather/scatter); ``TopPLogitsWarper`` is skipped when ``top_p >= 1`` (it then only masks
-        tokens whose probability is already exactly 0); the next input embedding is two fp32 table rows added in
-        numpy into a reused buffer. ``torch.multinomial(torch.softmax(...))`` is unchanged, so the random stream is
-        consumed exactly as upstream.
+        tokens whose probability is already exactly 0); ``MinPLogitsWarper`` is inlined without its ``topk`` /
+        ``scatter`` (with one token to keep, the most likely token is never below ``min_p`` times itself); the next
+        input embedding is two fp32 table rows added in numpy into a reused buffer.
+
+        ``torch.multinomial(probs, 1)`` is computed as torch does it on the CPU: ``argmax(probs / q)`` with ``q`` an
+        ``exponential_(1)`` draw of the shape of ``probs``. ``q`` does not depend on the logits, so it is drawn while
+        the device computes the step; the random stream is consumed in the same order as upstream, and the forward
+        pass after the last allowed token (whose logits are never used) is skipped.
         """
         t3 = self.model.t3
         prefill_len = prefill.shape[1]
@@ -341,7 +401,8 @@ class QEffChatterboxMultilingualTTS:
         logits = self._t3_prefill(prefill)
         perf.append(ModulePerf("t3_prefill", time.perf_counter() - start))
         penalty = float(repetition_penalty)
-        min_p_warper = MinPLogitsWarper(min_p=min_p)
+        if not 0.0 <= min_p <= 1.0:
+            raise ValueError(f"`min_p` has to be a float in the [0, 1] interval, but is {min_p}")
         top_p_warper = TopPLogitsWarper(top_p=top_p) if top_p < 1.0 else None
         speech_table = t3.speech_emb.weight.detach().numpy()
         position_table = t3.speech_pos_emb.emb.weight.detach().numpy()
@@ -349,6 +410,7 @@ class QEffChatterboxMultilingualTTS:
         seen[0, t3.hp.start_speech_token] = True
         embeds = np.empty((constants.CHATTERBOX_T3_CFG_BATCH_SIZE, 1, speech_table.shape[1]), dtype=np.float32)
         positions = np.empty((constants.CHATTERBOX_T3_CFG_BATCH_SIZE, 1), dtype=np.int64)
+        noise = torch.empty((1, logits.shape[-1]), dtype=torch.float32).exponential_(1)  # torch.multinomial's draw
         predicted, step_times = [], []
         for step in range(max_new_tokens):
             step_logits = torch.from_numpy(np.asarray(logits, dtype=np.float32))[:, -1, :]
@@ -357,20 +419,26 @@ class QEffChatterboxMultilingualTTS:
             scores = torch.where(seen, torch.where(scores < 0, scores * penalty, scores / penalty), scores)
             if temperature != 1.0:
                 scores = scores / temperature
-            scores = min_p_warper(None, scores)
+            probs = torch.softmax(scores, dim=-1)  # MinPLogitsWarper
+            scores = scores.masked_fill(probs < min_p * probs.amax(dim=-1, keepdim=True), -float("inf"))
             if top_p_warper is not None:
                 scores = top_p_warper(None, scores)
-            next_token = torch.multinomial(torch.softmax(scores, dim=-1), num_samples=1)
+            probs = torch.softmax(scores, dim=-1)
+            if not bool(torch.isfinite(probs).all()):  # torch.multinomial's check
+                raise RuntimeError("probability tensor contains either `inf`, `nan` or element < 0")
+            next_token = torch.div(probs, noise).argmax(dim=-1, keepdim=True)  # == torch.multinomial(probs, 1)
             predicted.append(next_token)
             token = int(next_token)
             seen[0, token] = True
-            if token == t3.hp.stop_speech_token:
+            if token == t3.hp.stop_speech_token or step + 1 == max_new_tokens:
                 break
             np.add(speech_table[token], position_table[step + 1], out=embeds[0, 0])
             embeds[1:] = embeds[0]
             positions.fill(prefill_len + step)
             start = time.perf_counter()
-            logits = self._t3_forward(embeds, positions)
+            wait = self._t3_forward_start(embeds, positions)
+            noise = torch.empty_like(noise).exponential_(1)  # next step's draw, while the device runs
+            logits = wait()
             step_times.append(time.perf_counter() - start)
         perf.append(ModulePerf("t3_decode", step_times))
         return torch.cat(predicted, dim=1)
@@ -383,18 +451,18 @@ class QEffChatterboxMultilingualTTS:
         t_span = torch.linspace(0, 1, constants.CHATTERBOX_CFM_TIMESTEPS + 1)
         t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)  # cosine scheduler
         output_shapes = {"dxdt": (2, constants.CHATTERBOX_MEL_CHANNELS, x.shape[-1])}
+        # inputs that do not change between steps: conditional row, then the unconditional (zero) row
+        fixed = {
+            "mask": torch.cat([mask, mask]).numpy(),
+            "mu": torch.cat([mu, torch.zeros_like(mu)]).numpy(),
+            "spks": torch.cat([spks, torch.zeros_like(spks)]).numpy(),
+            "cond": torch.cat([cond, torch.zeros_like(cond)]).numpy(),
+        }
         step_times = []
         for t, r in zip(t_span[:-1], t_span[1:]):
             start = time.perf_counter()
             dxdt = self._run(
-                "flow_estimator",
-                output_shapes,
-                x=torch.cat([x, x]).numpy(),
-                mask=torch.cat([mask, mask]).numpy(),
-                mu=torch.cat([mu, torch.zeros_like(mu)]).numpy(),
-                t=torch.stack([t, t]).numpy(),
-                spks=torch.cat([spks, torch.zeros_like(spks)]).numpy(),
-                cond=torch.cat([cond, torch.zeros_like(cond)]).numpy(),
+                "flow_estimator", output_shapes, x=torch.cat([x, x]).numpy(), t=torch.stack([t, t]).numpy(), **fixed
             )["dxdt"]
             step_times.append(time.perf_counter() - start)
             dxdt, cfg_dxdt = torch.from_numpy(dxdt).split(1)

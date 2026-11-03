@@ -6459,7 +6459,8 @@ def test_chatterbox_activate_opens_every_session(monkeypatch):
 
 
 @pytest.mark.cpu_only
-def test_chatterbox_failed_run_drops_the_session():
+@pytest.mark.parametrize("failing_step", ["submit", "collect"])
+def test_chatterbox_failed_run_drops_the_session(failing_step):
     """A failed device run unloads the program: the next call must open a fresh session, not reuse the dead one."""
     pytest.importorskip("chatterbox")
     from QEfficient.tts.pipelines.chatterbox import pipeline_chatterbox
@@ -6468,7 +6469,11 @@ def test_chatterbox_failed_run_drops_the_session():
         def set_buffers(self, buffers):
             pass
 
-        def run(self, inputs):
+        def submit(self, inputs):
+            if failing_step == "submit":
+                raise RuntimeError("device error")
+
+        def collect(self):
             raise RuntimeError("device error")
 
     pipeline = object.__new__(pipeline_chatterbox.QEffChatterboxMultilingualTTS)

@@ -1,5 +1,5 @@
 {
-  "description": "Default configuration for the Chatterbox Multilingual text-to-speech pipeline. T3 uses 16 cores; the four S3Gen graphs use 16 cores together (4 + 8 + 1 + 3), so the pipeline needs two SoCs' worth of cores. device_ids null lets the runtime pick free devices; set execute.device_ids to pin a module. S3Gen specializations are length buckets: tokens (prompt + speech) for the flow, mel frames for HiFT.",
+  "description": "Default configuration for the Chatterbox Multilingual text-to-speech pipeline. T3 (12 cores), the flow encoder (3) and HiFT F0 (1) fit one SoC; the flow estimator (8) and HiFT decoder (8) a second. device_ids null lets the runtime pick free devices; set execute.device_ids to pin a module. S3Gen specializations are length buckets: tokens (prompt + speech) for the flow, mel frames for HiFT; finer buckets mean less padding to compute.",
   "modules":
   {
     "t3":
@@ -8,37 +8,54 @@
           {"batch_size": 2, "seq_len": 128, "ctx_len": 2048, "_graph_name": "Prefill"},
           {"batch_size": 2, "seq_len": 1, "ctx_len": 2048, "_graph_name": "Decode"}
         ],
-        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "mxint8_kv_cache": false, "aic_num_cores": 16},
+        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "mxint8_kv_cache": false, "aic_num_cores": 12},
         "execute": {"device_ids": null, "qpc_path": null}
       },
     "flow_encoder":
       {
         "specializations": [
           {"n_tok": 256, "n_frames": 512, "_graph_name": "flow_encoder_tok256"},
+          {"n_tok": 320, "n_frames": 640, "_graph_name": "flow_encoder_tok320"},
+          {"n_tok": 384, "n_frames": 768, "_graph_name": "flow_encoder_tok384"},
+          {"n_tok": 448, "n_frames": 896, "_graph_name": "flow_encoder_tok448"},
           {"n_tok": 512, "n_frames": 1024, "_graph_name": "flow_encoder_tok512"},
+          {"n_tok": 640, "n_frames": 1280, "_graph_name": "flow_encoder_tok640"},
+          {"n_tok": 768, "n_frames": 1536, "_graph_name": "flow_encoder_tok768"},
           {"n_tok": 1024, "n_frames": 2048, "_graph_name": "flow_encoder_tok1024"},
           {"n_tok": 1280, "n_frames": 2560, "_graph_name": "flow_encoder_tok1280"}
         ],
-        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "convert_to_fp16": true, "aic_num_cores": 4},
+        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "convert_to_fp16": true, "aic_num_cores": 3},
         "execute": {"device_ids": null, "qpc_path": null}
       },
     "flow_estimator":
       {
         "specializations": [
           {"n_frames": 512, "_graph_name": "flow_estimator_frames512"},
+          {"n_frames": 640, "_graph_name": "flow_estimator_frames640"},
+          {"n_frames": 768, "_graph_name": "flow_estimator_frames768"},
+          {"n_frames": 896, "_graph_name": "flow_estimator_frames896"},
           {"n_frames": 1024, "_graph_name": "flow_estimator_frames1024"},
+          {"n_frames": 1280, "_graph_name": "flow_estimator_frames1280"},
+          {"n_frames": 1536, "_graph_name": "flow_estimator_frames1536"},
           {"n_frames": 2048, "_graph_name": "flow_estimator_frames2048"},
           {"n_frames": 2560, "_graph_name": "flow_estimator_frames2560"}
         ],
-        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "convert_to_fp16": true, "aic_num_cores": 8},
+        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "convert_to_fp16": true, "aic_num_cores": 8, "mos": 1},
         "execute": {"device_ids": null, "qpc_path": null}
       },
     "hift_f0":
       {
         "specializations": [
+          {"n_mel": 128, "_graph_name": "hift_f0_mel128"},
+          {"n_mel": 192, "_graph_name": "hift_f0_mel192"},
           {"n_mel": 256, "_graph_name": "hift_f0_mel256"},
+          {"n_mel": 320, "_graph_name": "hift_f0_mel320"},
+          {"n_mel": 384, "_graph_name": "hift_f0_mel384"},
           {"n_mel": 512, "_graph_name": "hift_f0_mel512"},
+          {"n_mel": 640, "_graph_name": "hift_f0_mel640"},
+          {"n_mel": 768, "_graph_name": "hift_f0_mel768"},
           {"n_mel": 1024, "_graph_name": "hift_f0_mel1024"},
+          {"n_mel": 1536, "_graph_name": "hift_f0_mel1536"},
           {"n_mel": 2048, "_graph_name": "hift_f0_mel2048"}
         ],
         "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "convert_to_fp16": true, "aic_num_cores": 1},
@@ -47,12 +64,19 @@
     "hift_decoder":
       {
         "specializations": [
+          {"n_mel": 128, "n_samples": 61440, "_graph_name": "hift_decoder_mel128"},
+          {"n_mel": 192, "n_samples": 92160, "_graph_name": "hift_decoder_mel192"},
           {"n_mel": 256, "n_samples": 122880, "_graph_name": "hift_decoder_mel256"},
+          {"n_mel": 320, "n_samples": 153600, "_graph_name": "hift_decoder_mel320"},
+          {"n_mel": 384, "n_samples": 184320, "_graph_name": "hift_decoder_mel384"},
           {"n_mel": 512, "n_samples": 245760, "_graph_name": "hift_decoder_mel512"},
+          {"n_mel": 640, "n_samples": 307200, "_graph_name": "hift_decoder_mel640"},
+          {"n_mel": 768, "n_samples": 368640, "_graph_name": "hift_decoder_mel768"},
           {"n_mel": 1024, "n_samples": 491520, "_graph_name": "hift_decoder_mel1024"},
+          {"n_mel": 1536, "n_samples": 737280, "_graph_name": "hift_decoder_mel1536"},
           {"n_mel": 2048, "n_samples": 983040, "_graph_name": "hift_decoder_mel2048"}
         ],
-        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "convert_to_fp16": true, "aic_num_cores": 3},
+        "compilation": {"onnx_path": null, "compile_dir": null, "mdp_ts_num_devices": 1, "mxfp6_matmul": false, "convert_to_fp16": true, "aic_num_cores": 8},
         "execute": {"device_ids": null, "qpc_path": null}
       }
   }

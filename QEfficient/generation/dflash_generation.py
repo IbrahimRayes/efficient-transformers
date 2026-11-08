@@ -272,6 +272,10 @@ def _run_spd_core(
                 gen_idx += 1
                 metrics.generated_ids.append(int(dlm_token[0]))
                 metrics.generated_sources.append("dlm")
+                if int(dlm_token[0]) in eos_token_ids:
+                    # Drafts after an accepted EOS and the bonus token are not emitted.
+                    continue_generation = False
+                    break
             else:
                 metrics.total_rejected_tokens += block_size - spec_idx - 1
                 rejected_flag = True
@@ -283,7 +287,7 @@ def _run_spd_core(
                 break
 
         metrics.acceptance_history.append(accepted_length)
-        if not rejected_flag and gen_idx < generation_limit:
+        if continue_generation and not rejected_flag and gen_idx < generation_limit:
             new_tlm_token = tlm_logits[:, block_size - 1]
             generated_ids[0, gen_idx] = new_tlm_token[0]
             gen_idx += 1
